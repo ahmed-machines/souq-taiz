@@ -1,0 +1,201 @@
+rules_version = '2';
+
+// Souq Taiz - Firestore security rules (PRODUCTION).
+// Default deny. Privileged mutations (moderation, suspension, roles, audit
+// log, notifications) are performed only by Cloud Functions (Admin SDK).
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function me() { return get(/databases/$(database)/documents/users/$(uid())).data; }
+    function isActive() { return signedIn() && me().status == 'active'; }
+    function isAdmin() { return isActive() && me().role in ['admin', 'super_admin']; }
+    function isSuperAdmin() { return isActive() && me().role == 'super_admin'; }
+    function changedKeys() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    function isStr(v, min, max) { return v is string && v.size() >= min && v.size() <= max; }
+
+    // ---------- users (private) ----------
+    match /users/{userId} {
+      allow read: if signedIn() && (uid() == userId || isAdmin());
+      // Self-registration is always a plain, active buyer.
+      allow create: if signedIn() && uid() == userId
+        && request.resource.data.role == 'buyer'
+        && request.resource.data.status == 'active'
+        && request.resource.data.keys().hasOnly(['email', 'displayName', 'phone', 'role', 'status', 'createdAt'])
+        && isStr(request.resource.data.displayName, 2, 100)
+        && request.resource.data.createdAt == request.time;
+      // Owners may edit only their display name and phone.
+      allow update: if isActive() && uid() == userId
+        && changedKeys().hasOnly(['displayName', 'phone'])
+        && isStr(request.resource.data.displayName, 2, 100);
+      allow delete: if false;
+
+      match /favorites/{listingId} {
+        allow read: if signedIn() && uid() == userId;
+        allow create: if isActive() && uid() == userId
+          && request.resource.data.listingId == listingId
+          && request.resource.data.keys().hasOnly(['listingId', 'createdAt'])
+          && request.resource.data.createdAt == request.time;
+        allow delete: if signedIn() && uid() == userId;
+        allow update: if false;
+      }
+
+      match /notifications/{id} {
+        allow read: if signedIn() && uid() == userId;
+        allow update: if signedIn() && uid() == userId && changedKeys().hasOnly(['read']);
+        allow create, delete: if false; // Cloud Functions only
+      }
+    }
+
+    // ---------- public profile ----------
+    match /user_profiles/{userId} {
+      allow read: if true;
+      allow create: if signedIn() && uid() == userId
+        && request.resource.data.keys().hasOnly(['displayName', 'photoUrl', 'createdAt']);
+      allow update: if isActive() && uid() == userId && changedKeys().hasOnly(['displayName', 'photoUrl']);
+      allow delete: if false;
+    }
+
+    // ---------- reference data ----------
+    match /categories/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    match /locations/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    match /app_settings/{id} {
+      allow read: if true;
+      allow write: if isSuperAdmin();
+    }
+
+    // ---------- listings ----------
+    match /listings/{listingId} {
+      allow read: if resource.data.status == 'published'
+        || (signedIn() && (resource.data.ownerId == uid() || isAdmin()));
+
+      allow create: if isActive()
+        && request.resource.data.ownerId == uid()
+        && request.resource.data.status in ['draft', 'pending_review']
+        && request.resource.data.isFeatured == false
+        && request.resource.data.viewCount == 0
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && validListing(request.resource.data);
+
+      allow update: if isActive() && resource.data.ownerId == uid()
+        && request.resource.data.ownerId == resource.data.ownerId
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.isFeatured == resource.data.isFeatured
+        && request.resource.data.viewCount == resource.data.viewCount
+        && request.resource.data.get('rejectionReason', null) == resource.data.get('rejectionReason', null)
+        && validStatusChange(resource.data.status, request.resource.data.status)
+        && (!contentChanged() || request.resource.data.status in ['draft', 'pending_review'])
+        && (!contentChanged() || validListing(request.resource.data));
+
+      // Soft delete only: owners archive, never hard-delete.
+      allow delete: if false;
+    }
+
+    function contentChanged() {
+      return changedKeys().hasAny(['title', 'description', 'categoryId', 'subcategoryId',
+        'locationId', 'price', 'currency', 'priceType', 'imageUrls', 'coverImageUrl',
+        'contactPhone', 'searchKeywords', 'ownerName']);
+    }
+
+    // Owners can never publish or reject; those come from moderation.
+    function validStatusChange(from, to) {
+      return from == to
+        || (from == 'published' && to in ['paused', 'sold', 'archived'])
+        || (from == 'paused' && to in ['pending_review', 'archived'])
+        || (from in ['draft', 'pending_review', 'rejected'] && to in ['draft', 'pending_review', 'archived'])
+        || (from == 'sold' && to == 'archived');
+    }
+
+    function validListing(d) {
+      return isStr(d.title, 5, 100)
+        && isStr(d.description, 10, 3000)
+        && d.price is number && d.price > 0 && d.price <= 1000000000000
+        && d.currency == 'YER'
+        && d.priceType in ['fixed', 'negotiable']
+        && isStr(d.categoryId, 1, 100)
+        && isStr(d.locationId, 1, 100)
+        && d.imageUrls is list && d.imageUrls.size() >= 1 && d.imageUrls.size() <= 8
+        && isStr(d.contactPhone, 9, 20)
+        && d.searchKeywords is list && d.searchKeywords.size() <= 10;
+    }
+
+    // ---------- conversations & messages ----------
+    match /conversations/{conversationId} {
+      allow read: if signedIn() && uid() in resource.data.participantIds;
+      allow create: if isActive()
+        && request.resource.data.participantIds.size() == 2
+        && uid() in request.resource.data.participantIds
+        && request.resource.data.participantIds[0] != request.resource.data.participantIds[1]
+        // The other participant must be the listing owner.
+        && get(/databases/$(database)/documents/listings/$(request.resource.data.listingId)).data.ownerId
+             in request.resource.data.participantIds
+        && conversationId == request.resource.data.listingId + '_' + uid();
+      allow update: if isActive() && uid() in resource.data.participantIds
+        && changedKeys().hasOnly(['lastMessage', 'lastMessageAt', 'lastSenderId']);
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        function parent() { return get(/databases/$(database)/documents/conversations/$(conversationId)).data; }
+        allow read: if signedIn() && uid() in parent().participantIds;
+        allow create: if isActive() && uid() in parent().participantIds
+          && request.resource.data.senderId == uid()
+          && isStr(request.resource.data.text, 1, 1000)
+          && request.resource.data.readAt == null
+          && request.resource.data.createdAt == request.time
+          && request.resource.data.keys().hasOnly(['senderId', 'text', 'createdAt', 'readAt']);
+        // Only the recipient may mark a message as read.
+        allow update: if signedIn() && uid() in parent().participantIds
+          && resource.data.senderId != uid()
+          && changedKeys().hasOnly(['readAt']);
+        allow delete: if false;
+      }
+    }
+
+    // ---------- reviews ----------
+    match /reviews/{reviewId} {
+      allow read: if resource.data.status == 'approved'
+        || (signedIn() && (resource.data.reviewerId == uid() || isAdmin()));
+      allow create: if isActive()
+        && request.auth.token.email_verified == true
+        && request.resource.data.reviewerId == uid()
+        && request.resource.data.sellerId != uid()
+        && reviewId == request.resource.data.sellerId + '_' + uid()
+        && request.resource.data.rating is int
+        && request.resource.data.rating >= 1 && request.resource.data.rating <= 5
+        && request.resource.data.text is string && request.resource.data.text.size() <= 500
+        && request.resource.data.status == 'pending'
+        && request.resource.data.createdAt == request.time;
+      // Moderation by admins; reviewers cannot edit (prevents tampering).
+      allow update: if isAdmin() && changedKeys().hasOnly(['status']);
+      allow delete: if false;
+    }
+
+    // ---------- reports ----------
+    match /reports/{reportId} {
+      allow create: if isActive()
+        && request.resource.data.reporterId == uid()
+        && reportId == request.resource.data.listingId + '_' + uid()
+        && request.resource.data.status == 'open'
+        && request.resource.data.reason in ['spam', 'prohibited', 'fraud', 'other']
+        && request.resource.data.details is string && request.resource.data.details.size() <= 500
+        && request.resource.data.createdAt == request.time;
+      allow read: if isAdmin();
+      allow update, delete: if false; // resolved through Cloud Functions
+    }
+
+    // ---------- audit log ----------
+    match /admin_logs/{logId} {
+      allow read: if isAdmin();
+      allow write: if false; // Cloud Functions only; immutable for clients
+    }
+  }
+}

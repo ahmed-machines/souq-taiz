@@ -1,0 +1,27 @@
+# Flutter / Dart
+.dart_tool/
+.packages
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+pubspec_overrides.yaml
+coverage/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Secrets and local configuration (never commit)
+.env
+.env.*
+!.env.example
+firebase_options_local.dart
+*service-account*.json
+*serviceAccountKey*.json
+.firebase/
+firebase-debug.log
+*.log
+
+# Cloud Functions
+functions/node_modules/
